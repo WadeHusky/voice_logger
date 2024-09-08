@@ -20,7 +20,7 @@ touch .env
 ```bash
 nohup python3 ds_bot.py &
 ```
-Запустить бота:
+Запустить бота не в фоне командой:
 ```bash
 python3 ds_bot.py
 ```
