@@ -27,7 +27,6 @@ kiev_tz = pytz.timezone('Europe/Kiev')
 backup_file = f'logs/voice_history_{datetime.datetime.now(kiev_tz).date()}.json'
 # Словарь для хранения истории подключений и отключений пользователей по серверам и каналам
 voice_history = {}
-logging_enabled = False  # Переменная для отслеживания состояния логирования
 cname = os.getenv("cname")
 
 #===================[WORK WITH DB]======================================
@@ -68,12 +67,11 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    global logging_enabled
-    if not logging_enabled: return
-
     guild_id = str(member.guild.id)  # Получаем ID сервера как строку
-    channel_id = str(after.channel.id) if after.channel else str(before.channel.id) if before.channel else None
+    # Проверка на включение логирования
+    if not voice_history[guild_id]["status"]: return
 
+    channel_id = str(after.channel.id) if after.channel else str(before.channel.id) if before.channel else None
     # Инициализируем историю для сервера, если её нет
     if guild_id not in voice_history:
         voice_history[guild_id] = {}
@@ -95,18 +93,14 @@ async def on_voice_state_update(member, before, after):
             }
         else:
             record = voice_history[guild_id][channel_id][user_id_str]
-            if record['leave_time'] is None:  # Если пользователь уже в канале
-                # Обновляем duration, сохраняя join time
-                ...
-            else:
-                duration = record["duration"]
-                # Если leave_time уже установлен, создаем новую запись
-                voice_history[guild_id][channel_id][user_id_str] = {
-                    'user_id': member.id,
-                    'join_time': join_time.isoformat(),
-                    'duration': duration,
-                    'leave_time': None,
-                }
+            duration = record["duration"]
+            # Если leave_time уже установлен, создаем новую запись
+            voice_history[guild_id][channel_id][user_id_str] = {
+                'user_id': member.id,
+                'join_time': join_time.isoformat(),
+                'duration': duration,
+                'leave_time': None,
+            }
         save_voice_history()  # Сохраняем историю после обновления
 
     # Если пользователь отключился от голосового канала
@@ -132,7 +126,7 @@ async def clear_voice_history(ctx):
     if (ctx.channel).name != cname: return
     global voice_history
     guild_id = str(ctx.guild.id)
-    voice_history[guild_id] = {}  # Очищаем историю
+    voice_history[guild_id] = {"status": voice_history[guild_id]["status"]}  # Очищаем историю
     save_voice_history()  # Сохраняем изменения в файл
     await ctx.send("История голосовых подключений очищена.")
 
@@ -147,16 +141,20 @@ async def clear_voice_history_error(ctx, error):
 async def start_logging(ctx):
     """Команда для начала логирования голосовых каналов."""
     if (ctx.channel).name != cname: return
-    global logging_enabled
-    logging_enabled = True
+    global voice_history
+    guild_id = str(ctx.guild.id)
+    voice_history[guild_id]["status"] = True
+    save_voice_history()
     await ctx.send("Логирование голосовых каналов включено.")
 
 @bot.command(name="stop")
 async def stop_logging(ctx):
     """Команда для остановки логирования голосовых каналов."""
     if (ctx.channel).name != cname: return
-    global logging_enabled
-    logging_enabled = False
+    global voice_history
+    guild_id = str(ctx.guild.id)
+    voice_history[guild_id]["status"] = False
+    save_voice_history()
     await ctx.send("Логирование голосовых каналов отключено.")
 
 
@@ -164,8 +162,12 @@ async def stop_logging(ctx):
 async def status_logging(ctx):
     """Команда для получения статуса логирования голосовых каналов."""
     if (ctx.channel).name != cname: return
-    global logging_enabled
-    await ctx.send("Логирование голосовых каналов включено." if logging_enabled else "Логирование голосовых каналов выключено.")
+    global voice_history
+    guild_id = str(ctx.guild.id)
+    if guild_id not in list(voice_history.keys()): voice_history[guild_id] = {}
+    if "status" not in list(voice_history[guild_id].keys()): voice_history[guild_id]["status"] = False
+    save_voice_history()
+    await ctx.send("Логирование голосовых каналов включено." if voice_history[guild_id]["status"] else "Логирование голосовых каналов выключено.")
 
 @bot.command(name='help', help="Команда для показа этого сообщения.")
 async def custom_help(ctx):
@@ -192,48 +194,49 @@ async def _log(ctx):
 
     # Проходим по всем голосовым каналам на сервере
     for channel_id, records in voice_history[guild_id].items():
-        for user_id_str, record in records.items():  # Исправлено: итерируем по элементам словаря
-            user_id = record['user_id']
-            join_time = datetime.datetime.fromisoformat(record['join_time'])  # Преобразуем обратно в datetime
-            leave_time = record['leave_time']
+        if channel_id != "status":
+            for user_id_str, record in records.items():  # Исправлено: итерируем по элементам словаря
+                user_id = record['user_id']
+                join_time = datetime.datetime.fromisoformat(record['join_time'])  # Преобразуем обратно в datetime
+                leave_time = record['leave_time']
 
-            try:
-                member = await ctx.guild.fetch_member(user_id)  # Получаем участника по ID
-                member_mention = member.mention
-            except discord.NotFound:
-                continue  # Пропускаем, если пользователь не найден
-            except discord.Forbidden:
-                continue  # Пропускаем, если нет прав
-            except discord.HTTPException:
-                continue  # Пропускаем, если произошла ошибка
-            channel = bot.get_channel(int(channel_id))
-            channel_name = channel.name
-            if leave_time is None:  # Если пользователь все еще в голосовом канале
-                # Получаем продолжительность из базы данных
-                db_duration = record['duration']  # Продолжительность в секундах из базы данных (тип float)
-                current_duration = datetime.datetime.now(kiev_tz) - join_time  # Текущая продолжительность
-                total_duration = db_duration + current_duration.total_seconds()  # Суммируем продолжительности
+                try:
+                    member = await ctx.guild.fetch_member(user_id)  # Получаем участника по ID
+                    member_mention = member.mention
+                except discord.NotFound:
+                    continue  # Пропускаем, если пользователь не найден
+                except discord.Forbidden:
+                    continue  # Пропускаем, если нет прав
+                except discord.HTTPException:
+                    continue  # Пропускаем, если произошла ошибка
+                channel = bot.get_channel(int(channel_id))
+                channel_name = channel.name
+                if leave_time is None:  # Если пользователь все еще в голосовом канале
+                    # Получаем продолжительность из базы данных
+                    db_duration = record['duration']  # Продолжительность в секундах из базы данных (тип float)
+                    current_duration = datetime.datetime.now(kiev_tz) - join_time  # Текущая продолжительность
+                    total_duration = db_duration + current_duration.total_seconds()  # Суммируем продолжительности
 
-                # Округляем общую продолжительность до ближайшей секунды
-                rounded_duration = round(total_duration)
-                hours, remainder = divmod(rounded_duration, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                log_messages.append(
-                    f"{member_mention} подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
-                    f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
-                )
-            else:
-                leave_time = datetime.datetime.fromisoformat(leave_time)  # Преобразуем обратно в datetime
-                if leave_time.date() == today:  # Проверяем, что отключение произошло сегодня
-                    duration = record["duration"]
-                    # Округляем продолжительность до ближайшей секунды
-                    rounded_duration = round(duration)
+                    # Округляем общую продолжительность до ближайшей секунды
+                    rounded_duration = round(total_duration)
                     hours, remainder = divmod(rounded_duration, 3600)
                     minutes, seconds = divmod(remainder, 60)
                     log_messages.append(
                         f"{member_mention} подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
                         f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
                     )
+                else:
+                    leave_time = datetime.datetime.fromisoformat(leave_time)  # Преобразуем обратно в datetime
+                    if leave_time.date() == today:  # Проверяем, что отключение произошло сегодня
+                        duration = record["duration"]
+                        # Округляем продолжительность до ближайшей секунды
+                        rounded_duration = round(duration)
+                        hours, remainder = divmod(rounded_duration, 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        log_messages.append(
+                            f"{member_mention} подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
+                            f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
+                        )
 
     if log_messages:
         await ctx.send("\n".join(log_messages))
@@ -258,48 +261,49 @@ async def _send(ctx):
 
     # Проходим по всем голосовым каналам на сервере
     for channel_id, records in voice_history[guild_id].items():
-        for user_id_str, record in records.items():  # Исправлено: итерируем по элементам словаря
-            user_id = record['user_id']
-            join_time = datetime.datetime.fromisoformat(record['join_time'])  # Преобразуем обратно в datetime
-            leave_time = record['leave_time']
+        if channel_id != "status":
+            for user_id_str, record in records.items():  # Исправлено: итерируем по элементам словаря
+                user_id = record['user_id']
+                join_time = datetime.datetime.fromisoformat(record['join_time'])  # Преобразуем обратно в datetime
+                leave_time = record['leave_time']
 
-            try:
-                member = await ctx.guild.fetch_member(user_id)  # Получаем участника по ID
-                m_name = member.name; m_d_name = member.display_name
-            except discord.NotFound:
-                continue  # Пропускаем, если пользователь не найден
-            except discord.Forbidden:
-                continue  # Пропускаем, если нет прав
-            except discord.HTTPException:
-                continue  # Пропускаем, если произошла ошибка
-            channel = bot.get_channel(int(channel_id))
-            channel_name = channel.name
-            if leave_time is None:  # Если пользователь все еще в голосовом канале
-                # Получаем продолжительность из базы данных
-                db_duration = record['duration']  # Продолжительность в секундах из базы данных (тип float)
-                current_duration = datetime.datetime.now(kiev_tz) - join_time  # Текущая продолжительность
-                total_duration = db_duration + current_duration.total_seconds()  # Суммируем продолжительности
+                try:
+                    member = await ctx.guild.fetch_member(user_id)  # Получаем участника по ID
+                    m_name = member.name; m_d_name = member.display_name
+                except discord.NotFound:
+                    continue  # Пропускаем, если пользователь не найден
+                except discord.Forbidden:
+                    continue  # Пропускаем, если нет прав
+                except discord.HTTPException:
+                    continue  # Пропускаем, если произошла ошибка
+                channel = bot.get_channel(int(channel_id))
+                channel_name = channel.name
+                if leave_time is None:  # Если пользователь все еще в голосовом канале
+                    # Получаем продолжительность из базы данных
+                    db_duration = record['duration']  # Продолжительность в секундах из базы данных (тип float)
+                    current_duration = datetime.datetime.now(kiev_tz) - join_time  # Текущая продолжительность
+                    total_duration = db_duration + current_duration.total_seconds()  # Суммируем продолжительности
 
-                # Округляем общую продолжительность до ближайшей секунды
-                rounded_duration = round(total_duration)
-                hours, remainder = divmod(rounded_duration, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                log_messages.append(
-                    f"@{m_name} ({m_d_name}) подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
-                    f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
-                )
-            else:
-                leave_time = datetime.datetime.fromisoformat(leave_time)  # Преобразуем обратно в datetime
-                if leave_time.date() == today:  # Проверяем, что отключение произошло сегодня
-                    duration = record["duration"]
-                    # Округляем продолжительность до ближайшей секунды
-                    rounded_duration = round(duration)
+                    # Округляем общую продолжительность до ближайшей секунды
+                    rounded_duration = round(total_duration)
                     hours, remainder = divmod(rounded_duration, 3600)
                     minutes, seconds = divmod(remainder, 60)
                     log_messages.append(
                         f"@{m_name} ({m_d_name}) подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
                         f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
                     )
+                else:
+                    leave_time = datetime.datetime.fromisoformat(leave_time)  # Преобразуем обратно в datetime
+                    if leave_time.date() == today:  # Проверяем, что отключение произошло сегодня
+                        duration = record["duration"]
+                        # Округляем продолжительность до ближайшей секунды
+                        rounded_duration = round(duration)
+                        hours, remainder = divmod(rounded_duration, 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        log_messages.append(
+                            f"@{m_name} ({m_d_name}) подключен к каналу {channel_name} с {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"\
+                            f"(продолжительность: {hours}ч {minutes}м {seconds}с)\n"
+                        )
 
     if log_messages:
         with open(f"logs/{guild_id}.txt", "w", encoding="utf-8") as f:
@@ -309,4 +313,5 @@ async def _send(ctx):
         os.system(f"rm logs/{guild_id}.txt")
     else:
         await ctx.send("Нет записей о подключениях и отключениях за сегодня.")
+
 bot.run(os.getenv("token"))
